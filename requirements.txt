@@ -3,3 +3,9 @@ uvicorn
 yfinance
 supabase
 python-dotenv
+pandas
+scikit-learn
+numpy
+datetime
+prophet
+tensorflow
