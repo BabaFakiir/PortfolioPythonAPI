@@ -4,10 +4,11 @@ from datetime import datetime, timedelta
 import yfinance as yf
 from database.supabase_client import supabase
 import pandas as pd
-import math  # ✅ for NaN/Inf checks
+import math  
 
 
 router = APIRouter()
+
 
 def calculate_RSI_series(prices, period=14):
     prices = pd.Series(prices)
@@ -31,6 +32,29 @@ def calculate_RSI_series(prices, period=14):
         else:
             rsi_clean.append(float(val))
     return rsi_clean
+
+
+def calculate_macd(prices: list[float]):
+    """
+    prices: list of close prices in chronological order
+    returns: DataFrame with macd, signal, histogram
+    """
+    df = pd.DataFrame(prices, columns=["close"])
+    
+    # Calculate EMAs
+    df["ema12"] = df["close"].ewm(span=12, adjust=False).mean()
+    df["ema26"] = df["close"].ewm(span=26, adjust=False).mean()
+    
+    # MACD line
+    df["macd"] = df["ema12"] - df["ema26"]
+    
+    # Signal line (9-day EMA of MACD)
+    df["signal"] = df["macd"].ewm(span=9, adjust=False).mean()
+    
+    # Histogram
+    df["histogram"] = df["macd"] - df["signal"]
+    
+    return df[["macd", "signal", "histogram"]].to_dict(orient="records")
 
 
 @router.get("/stock-price/{symbol}")
@@ -82,14 +106,16 @@ async def get_stock_data(symbol: str):
     price_deviation = (latest_price - avg_price) if avg_price else 0
     price_deviation_percent = (price_deviation / avg_price * 100) if avg_price else 0
 
-    # ✅ RSI full series (already cleaned)
     price_series = [row['avg_price'] for row in sorted_data]
+
     rsi_series = calculate_RSI_series(price_series, period=14) if len(price_series) >= 14 else []
 
-    # Attach RSI to each date
+    macd_data = calculate_macd(price_series)
+    
     data_with_rsi = []
     for i, row in enumerate(sorted_data):
         rsi_val = rsi_series[i] if i < len(rsi_series) else None
+
         data_with_rsi.append({
             "date": row['date'],
             "avg_price": row['avg_price'],
@@ -105,6 +131,10 @@ async def get_stock_data(symbol: str):
         "latest_price": latest_price,
         "price_deviation": price_deviation,
         "price_deviation_percent": price_deviation_percent,
-        "rsi": latest_rsi,  # safe for quick checks
-        "data": data_with_rsi
+        "rsi": latest_rsi,  
+        "data": data_with_rsi,   
+        "macd_data": [
+            {"date": sorted_data[i]["date"], **macd_data[i]}
+            for i in range(len(sorted_data))
+        ]
     }
