@@ -3,9 +3,35 @@ from services.data_fetcher import fetch_and_store_stock_data
 from datetime import datetime, timedelta
 import yfinance as yf
 from database.supabase_client import supabase
+import pandas as pd
+import math  # ✅ for NaN/Inf checks
 
 
 router = APIRouter()
+
+def calculate_RSI_series(prices, period=14):
+    prices = pd.Series(prices)
+    delta = prices.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    # Wilder’s smoothing method (EMA with alpha = 1/period)
+    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    # ✅ Replace NaN/Inf with None so JSON is valid
+    rsi_clean = []
+    for val in rsi.tolist():
+        if val is None or math.isnan(val) or math.isinf(val):
+            rsi_clean.append(None)
+        else:
+            rsi_clean.append(float(val))
+    return rsi_clean
+
 
 @router.get("/stock-price/{symbol}")
 async def get_stock_data(symbol: str):
@@ -20,49 +46,57 @@ async def get_stock_data(symbol: str):
         .execute()
 
     if response.data and len(response.data) >= 28:
-        # Return sorted data from Supabase
         sorted_data = sorted(response.data, key=lambda x: x['date'])
-        return [{"date": row['date'], "avg_price": row['avg_price']} for row in sorted_data]
+    else:
+        data = yf.download(symbol, period="30d", interval="1d")
+        if data.empty:
+            raise HTTPException(status_code=404, detail="Symbol not found or no data")
 
-    # Fetch from Yahoo Finance
-    data = yf.download(symbol, period="30d", interval="1d")
-    if data.empty:
-        raise HTTPException(status_code=404, detail="Symbol not found or no data")
+        existing_dates_response = supabase.table("stock_prices") \
+            .select("date") \
+            .eq("symbol", symbol) \
+            .execute()
 
-    # Get existing dates from Supabase
-    existing_dates_response = supabase.table("stock_prices") \
-        .select("date") \
-        .eq("symbol", symbol) \
-        .execute()
+        existing_dates = {row["date"] for row in existing_dates_response.data}
 
-    existing_dates = {row["date"] for row in existing_dates_response.data}
+        new_rows = []
+        for date, row in data.iterrows():
+            date_str = date.strftime('%Y-%m-%d')
+            if date_str not in existing_dates:
+                avg_price = float(row['Close'])
+                new_rows.append({
+                    "symbol": symbol,
+                    "date": date_str,
+                    "avg_price": avg_price
+                })
 
-    # Filter and prepare new rows only
-    new_rows = []
-    for date, row in data.iterrows():
-        date_str = date.strftime('%Y-%m-%d')
-        if date_str not in existing_dates:
-            avg_price = float(row['Close'])
-            new_rows.append({
-                "symbol": symbol,
-                "date": date_str,
-                "avg_price": avg_price
-            })
+        if new_rows:
+            supabase.table("stock_prices").insert(new_rows).execute()
 
-    # Insert only new rows
-    if new_rows:
-        supabase.table("stock_prices").insert(new_rows).execute()
+        sorted_data = sorted(response.data + new_rows, key=lambda x: x['date'])
 
-    # Combine existing + new data for return
-    combined_data = response.data + new_rows
-    sorted_data = sorted(combined_data, key=lambda x: x['date'])
     highest_price = max(row['avg_price'] for row in sorted_data)
     lowest_price = min(row['avg_price'] for row in sorted_data)
     avg_price = sum(row['avg_price'] for row in sorted_data) / len(sorted_data) if sorted_data else 0
-    # get latest price from yfinance data
-    latest_price = float(data['Close'].iloc[-1]) if not data.empty else None
+    latest_price = sorted_data[-1]['avg_price'] if sorted_data else None
     price_deviation = (latest_price - avg_price) if avg_price else 0
     price_deviation_percent = (price_deviation / avg_price * 100) if avg_price else 0
+
+    # ✅ RSI full series (already cleaned)
+    price_series = [row['avg_price'] for row in sorted_data]
+    rsi_series = calculate_RSI_series(price_series, period=14) if len(price_series) >= 14 else []
+
+    # Attach RSI to each date
+    data_with_rsi = []
+    for i, row in enumerate(sorted_data):
+        rsi_val = rsi_series[i] if i < len(rsi_series) else None
+        data_with_rsi.append({
+            "date": row['date'],
+            "avg_price": row['avg_price'],
+            "rsi": rsi_val
+        })
+
+    latest_rsi = rsi_series[-1] if rsi_series else None
 
     return {
         "highest_price": highest_price,
@@ -71,5 +105,6 @@ async def get_stock_data(symbol: str):
         "latest_price": latest_price,
         "price_deviation": price_deviation,
         "price_deviation_percent": price_deviation_percent,
-        "data": [{"date": row['date'], "avg_price": row['avg_price']} for row in sorted_data]
+        "rsi": latest_rsi,  # safe for quick checks
+        "data": data_with_rsi
     }
